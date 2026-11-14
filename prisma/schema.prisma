@@ -1,0 +1,85 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum ChannelType {
+  WHATSAPP
+  TELEGRAM
+}
+
+enum MessagePriority {
+  HIGH
+  NORMAL
+}
+
+enum MessageType {
+  TEXT
+  DOCUMENT
+  IMAGE
+}
+
+enum MessageStatus {
+  PENDING
+  PROCESSING
+  SENT
+  FAILED
+}
+
+// 1. Proyectos o Clientes (Multi-Tenant)
+model Tenant {
+  id                 String         @id @default(uuid())
+  name               String
+  apiKey             String         @unique @map("api_key")
+  isActive           Boolean        @default(true) @map("is_active")
+  telegramBotToken   String?        @map("telegram_bot_token")
+  lastWhatsappSentAt DateTime?      @map("last_whatsapp_sent_at")
+  createdAt          DateTime       @default(now()) @map("created_at")
+
+  sessions           SessionCreds[]
+  messages           MessageQueue[]
+
+  @@map("tenants")
+}
+
+// 2. Llaves Criptográficas de Sesión (Reemplaza archivos JSON sueltos de Baileys)
+model SessionCreds {
+  tenantId  String      @map("tenant_id")
+  channel   ChannelType @default(WHATSAPP)
+  keyId     String      @map("key_id")
+  data      Json
+  updatedAt DateTime    @updatedAt @map("updated_at")
+
+  tenant    Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@id([tenantId, channel, keyId])
+  @@map("session_creds")
+}
+
+// 3. Cola de Mensajes con Auto-Limpieza de Payload a las 24h
+model MessageQueue {
+  id          String          @id @default(uuid())
+  tenantId    String          @map("tenant_id")
+  channel     ChannelType
+  priority    MessagePriority @default(NORMAL)
+  recipient   String
+  type        MessageType     @default(TEXT)
+  payload     Json?           // Se limpia a NULL 24h después de SENT por privacidad y espacio
+  status      MessageStatus   @default(PENDING)
+  attempts    Int             @default(0)
+  errorReason String?         @map("error_reason")
+  scheduledAt DateTime        @default(now()) @map("scheduled_at")
+  sentAt      DateTime?       @map("sent_at")
+  createdAt   DateTime        @default(now()) @map("created_at")
+
+  tenant      Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([status, priority, scheduledAt, createdAt])
+  @@index([status, sentAt])
+  @@map("message_queue")
+}
+

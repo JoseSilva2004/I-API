@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  iapi-db:
+    image: postgres:16-alpine
+    container_name: iapi-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: iapi_user
+      POSTGRES_PASSWORD: iapi_pass_2026
+      POSTGRES_DB: iapi_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - iapi_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iapi_user -d iapi_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  iapi-server:
+    build: .
+    container_name: iapi-server
+    restart: unless-stopped
+    ports:
+      - "3100:3100"
+    env_file:
+      - .env
+    depends_on:
+      iapi-db:
+        condition: service_healthy
+    volumes:
+      - ./src:/app/src
+      - ./prisma:/app/prisma
+
+volumes:
+  iapi_pgdata:
+

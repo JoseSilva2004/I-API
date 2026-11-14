@@ -1,0 +1,21 @@
+# Dependencias y compilación
+node_modules/
+dist/
+npm-debug.log*
+
+# Variables de entorno y secretos (NUNCA subir .env real)
+.env
+.env.local
+.env.*.local
+
+# Datos locales o volúmenes de base de datos
+pgdata/
+*.sqlite
+*.db
+
+# Sistema operativo y editores
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
