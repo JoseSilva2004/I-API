@@ -23,6 +23,7 @@ const randomBetween = (min: number, max: number): number =>
 export class QueueWorker {
   private isRunning = false;
   private timer?: NodeJS.Timeout;
+  private burstCounters = new Map<string, number>();
 
   start(): void {
     if (this.timer) return;
@@ -87,6 +88,30 @@ export class QueueWorker {
         const lastSent = tenant.lastWhatsappSentAt ? tenant.lastWhatsappSentAt.getTime() : 0;
         const elapsedSinceLast = now - lastSent;
 
+        // Si el número estuvo en reposo (> 2 min), reinicia el contador de ráfaga
+        if (lastSent === 0 || elapsedSinceLast >= env.idleThresholdMs) {
+          this.burstCounters.set(msg.tenant_id, 0);
+        }
+
+        const currentBurst = this.burstCounters.get(msg.tenant_id) || 0;
+        const maxBatchBeforeBreak = randomBetween(12, 15);
+
+        // Micro-descanso humano: cada 12-15 mensajes consecutivos toma una pausa de 3 a 5 minutos
+        if (currentBurst >= maxBatchBeforeBreak) {
+          const coffeeBreakMs = randomBetween(180000, 300000);
+          this.burstCounters.set(msg.tenant_id, 0);
+          await prisma.messageQueue.update({
+            where: { id: msg.id },
+            data: {
+              status: 'PENDING',
+              attempts: { decrement: 1 },
+              scheduledAt: new Date(now + coffeeBreakMs)
+            }
+          });
+          console.log(`[QueueWorker] Pausa humana anti-baneo activada (${Math.round(coffeeBreakMs / 1000)}s) tras ${currentBurst} envíos.`);
+          return;
+        }
+
         // Si el número está en ráfaga (< 2 min desde el último envío), reprograma con Jitter 20-45s
         const minSafeWindow = randomBetween(env.burstDelayMinMs, env.burstDelayMaxMs);
         if (lastSent > 0 && elapsedSinceLast < env.idleThresholdMs && elapsedSinceLast < minSafeWindow) {
@@ -104,14 +129,14 @@ export class QueueWorker {
           return;
         }
 
-        const typingMs = randomBetween(env.fastTypingMinMs, env.fastTypingMaxMs);
         await whatsappAdapter.send({
           tenantId: msg.tenant_id,
           recipient: msg.recipient,
           type: msg.type,
-          payload: msg.payload || {},
-          simulateTypingMs: typingMs
+          payload: msg.payload || {}
         });
+
+        this.burstCounters.set(msg.tenant_id, currentBurst + 1);
 
         const sentTime = new Date();
         await prisma.$transaction([

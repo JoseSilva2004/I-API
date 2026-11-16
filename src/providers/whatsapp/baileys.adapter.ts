@@ -21,6 +21,20 @@ interface InstanceSession {
 
 const logger = pino({ level: 'silent' });
 
+const randomInt = (min: number, max: number): number =>
+  Math.floor(Math.random() * (max - min + 1)) + min;
+
+// Polimorfismo de texto: resuelve Spintax {Hola|Buen día} y añade micro-referencia única anti-hash
+function humanizeContent(text?: string, messageId?: string): string {
+  if (!text) return '';
+  const spun = text.replace(/\{([^{}]+)\}/g, (_, options: string) => {
+    const parts = options.split('|');
+    return parts[randomInt(0, parts.length - 1)];
+  });
+  const shortRef = (messageId || Math.random().toString(36).substring(2, 6)).slice(0, 4).toUpperCase();
+  return `${spun}\n\n_Ref: #${shortRef}_`;
+}
+
 // Motor de WhatsApp Multi-Instancia con reconexión inteligente y soporte QR / Pairing Code
 export class WhatsAppAdapter implements IMessageProvider {
   private sessions = new Map<string, InstanceSession>();
@@ -62,6 +76,23 @@ export class WhatsAppAdapter implements IMessageProvider {
     this.sessions.set(tenantId, instanceState);
 
     sock.ev.on('creds.update', saveCreds);
+
+    // Auto-Read: marca como leídos los mensajes entrantes tras 3-8s para mejorar el Trust Score ante Meta
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify') return;
+      for (const msg of messages) {
+        if (!msg.key.fromMe && msg.key.remoteJid && msg.key.remoteJid !== 'status@broadcast') {
+          const readDelayMs = randomInt(3000, 8000);
+          setTimeout(async () => {
+            try {
+              await sock.readMessages([msg.key]);
+            } catch {
+              // Ignorar si el socket se cerró durante la espera
+            }
+          }, readDelayMs);
+        }
+      }
+    });
 
     // Promesa para capturar el primer QR o Pairing Code sin bloquear indefinidamente
     return new Promise((resolve) => {
@@ -169,9 +200,9 @@ export class WhatsAppAdapter implements IMessageProvider {
     };
   }
 
-  // Envía mensaje o documento simulando presencia ("Escribiendo...")
+  // Envía mensaje o documento con tiempo de escritura proporcional y huella polimórfica
   async send(options: SendMessageOptions): Promise<{ externalId?: string }> {
-    const { tenantId, recipient, type, payload, simulateTypingMs = 3500 } = options;
+    const { tenantId, recipient, type, payload } = options;
     const session = this.sessions.get(tenantId);
 
     if (!session || session.status !== 'CONNECTED') {
@@ -187,17 +218,27 @@ export class WhatsAppAdapter implements IMessageProvider {
     }
 
     const jid = check.jid;
-
-    // Simulación humana: "Escribiendo..."
     await session.socket.presenceSubscribe(jid);
-    await session.socket.sendPresenceUpdate('composing', jid);
-    await new Promise((r) => setTimeout(r, simulateTypingMs));
-    await session.socket.sendPresenceUpdate('paused', jid);
 
     if (type === 'TEXT') {
-      const sent = await session.socket.sendMessage(jid, { text: payload.text || '' });
+      const finalText = humanizeContent(payload.text);
+      // Calcula tiempo de escritura humano (~50ms por carácter, mínimo 1.8s, máximo 8.5s + variación)
+      const baseTypingMs = Math.min(Math.max(finalText.length * 50, 1800), 8500);
+      const typingMs = baseTypingMs + randomInt(200, 1100);
+
+      await session.socket.sendPresenceUpdate('composing', jid);
+      await new Promise((r) => setTimeout(r, typingMs));
+      await session.socket.sendPresenceUpdate('paused', jid);
+
+      const sent = await session.socket.sendMessage(jid, { text: finalText });
       return { externalId: sent?.key.id || undefined };
     }
+
+    // Para archivos (PDF/Imagen): pausa corta de adjuntado sin fingir escritura larga
+    await new Promise((r) => setTimeout(r, randomInt(1200, 2400)));
+    const finalCaption = payload.caption || payload.text
+      ? humanizeContent(payload.caption || payload.text)
+      : undefined;
 
     if (type === 'DOCUMENT') {
       const buffer = payload.mediaBase64
@@ -208,7 +249,7 @@ export class WhatsAppAdapter implements IMessageProvider {
         document: buffer,
         mimetype: payload.mimeType || 'application/pdf',
         fileName: payload.fileName || 'documento.pdf',
-        caption: payload.caption || payload.text
+        caption: finalCaption
       });
       return { externalId: sent?.key.id || undefined };
     }
@@ -220,7 +261,7 @@ export class WhatsAppAdapter implements IMessageProvider {
 
       const sent = await session.socket.sendMessage(jid, {
         image: buffer,
-        caption: payload.caption || payload.text
+        caption: finalCaption
       });
       return { externalId: sent?.key.id || undefined };
     }

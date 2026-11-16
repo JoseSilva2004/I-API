@@ -19,7 +19,7 @@ export class CleanupWorker {
       where: {
         status: 'SENT',
         sentAt: { lte: cutoff },
-        NOT: { payload: Prisma.DbNull }
+        payload: { not: Prisma.DbNull }
       },
       data: {
         payload: Prisma.DbNull
