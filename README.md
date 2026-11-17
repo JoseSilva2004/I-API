@@ -34,6 +34,26 @@ API REST Multi-Proyecto (*Multi-Tenant*) construida con **Node.js, TypeScript, F
    ```
    *(La llave se almacena con hash SHA-256 en PostgreSQL y se muestra por única vez en consola al crearse).*
 
+### Base de datos y migraciones
+
+El contenedor ejecuta `prisma migrate deploy` al arrancar (migraciones versionadas en `prisma/migrations`). Si la base se creó con una versión anterior que usaba `prisma db push`, el arranque detecta el error `P3005` y registra la migración `0_init` como aplicada antes de continuar. Para cambiar el esquema en desarrollo:
+
+```bash
+npx prisma migrate dev --name descripcion_del_cambio
+```
+
+### Despliegue seguro
+
+- Por defecto el puerto 3100 se publica solo en `127.0.0.1` (`IAPI_BIND_ADDRESS`). Para exponer la API fuera del servidor, póngala detrás de un proxy con TLS (nginx, Caddy o Traefik) y active `TRUST_PROXY=true` para que el límite de intentos use la IP real del cliente.
+- Si los sistemas cliente envían los archivos en `mediaBase64`, desactive `ALLOW_MEDIA_URL=false`.
+
+### Pruebas
+
+```bash
+npm run test:unit                       # utilidades (sin base de datos)
+IAPI_URL=http://localhost:3100 IAPI_API_KEY=... IAPI_ADMIN_KEY=... npm run test:smoke   # contra una instancia en marcha
+```
+
 ---
 
 ## 📱 Vinculación de WhatsApp (QR o Código de 8 Dígitos)
@@ -94,6 +114,9 @@ Verifica si el mensaje está en `PENDING`, `PROCESSING`, `SENT` o `FAILED`.
 ### 4. Consultar Estado de Conexión (`GET /api/v1/instances/status`)
 Devuelve si el socket de WhatsApp y el Bot de Telegram están `CONNECTED` o `DISCONNECTED`.
 
+### 4b. Desvincular el Número de WhatsApp (`POST /api/v1/instances/logout`)
+Cierra la sesión en WhatsApp (el teléfono deja de mostrarla en "Dispositivos vinculados") y borra las credenciales del proyecto. La siguiente llamada a `/instances/connect` devuelve un QR nuevo.
+
 ### 5. Crear un Nuevo Proyecto / Cliente (`POST /api/v1/tenants`)
 Requiere el header administrativo `x-admin-key`:
 ```bash
@@ -145,14 +168,18 @@ function enviarMensajeIAPI(string $telefono, string $texto, string $prioridad = 
 I-API/
 ├── docker-compose.yml          # Orquestación de API + PostgreSQL 16 Alpine
 ├── Dockerfile                  # Contenedor Node.js 20 Alpine
+├── docker-entrypoint.sh        # Migraciones (prisma migrate deploy) y arranque
 ├── prisma/
-│   └── schema.prisma           # Tablas: tenants, session_creds y message_queue
+│   ├── schema.prisma           # Tablas: tenants, session_creds y message_queue
+│   └── migrations/             # Migraciones versionadas
+├── tests/                      # Pruebas unitarias y de humo
 └── src/
     ├── server.ts               # Entrada Fastify y arranque de Workers
     ├── config/                 # Variables de entorno y cliente Prisma
     ├── middlewares/            # Autenticación por x-api-key y x-admin-key
     ├── modules/                # Rutas REST (instances y messages)
     ├── providers/              # Adaptadores desacoplados (WhatsApp Baileys / Telegram)
+    ├── utils/                  # Validación anti-SSRF, formato de mensajes y redacción de logs
     └── workers/                # Cola SKIP LOCKED anti-baneo y limpieza 24h
 ```
 

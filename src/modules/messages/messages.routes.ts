@@ -1,9 +1,9 @@
-import dns from 'dns/promises';
-import net from 'net';
 import { FastifyInstance } from 'fastify';
 import { prisma } from '../../config/prisma.js';
 import { requireApiKey } from '../../middlewares/auth.middleware.js';
 import { cleanupWorker } from '../../workers/cleanup.worker.js';
+import { env } from '../../config/env.js';
+import { validateSafeMediaUrl } from '../../utils/safe-url.js';
 
 interface SendMessageBody {
   channel?: string;
@@ -24,88 +24,6 @@ interface SendMessageBody {
 const VALID_CHANNELS = new Set(['WHATSAPP', 'TELEGRAM']);
 const VALID_PRIORITIES = new Set(['HIGH', 'NORMAL']);
 const VALID_TYPES = new Set(['TEXT', 'DOCUMENT', 'IMAGE']);
-
-function isPrivateOrReservedIp(ip: string): boolean {
-  if (net.isIPv4(ip)) {
-    const parts = ip.split('.').map(Number);
-    const [a, b] = parts;
-    if (
-      a === 0 ||
-      a === 10 ||
-      a === 127 ||
-      (a === 169 && b === 254) ||
-      (a === 172 && b >= 16 && b <= 31) ||
-      (a === 192 && b === 168) ||
-      (a === 100 && b >= 64 && b <= 127)
-    ) {
-      return true;
-    }
-    return false;
-  }
-
-  if (net.isIPv6(ip)) {
-    const normalized = ip.toLowerCase();
-    if (
-      normalized === '::1' ||
-      normalized === '::' ||
-      normalized.startsWith('fc') ||
-      normalized.startsWith('fd') ||
-      normalized.startsWith('fe80') ||
-      normalized.startsWith('::ffff:127.') ||
-      normalized.startsWith('::ffff:10.') ||
-      normalized.startsWith('::ffff:192.168.')
-    ) {
-      return true;
-    }
-  }
-  return false;
-}
-
-// Valida que mediaUrl sea HTTPS público y previene ataques SSRF hacia la red interna o contenedores
-async function validateSafeMediaUrl(rawUrl: string): Promise<{ valid: boolean; reason?: string }> {
-  let parsed: URL;
-  try {
-    parsed = new URL(rawUrl);
-  } catch {
-    return { valid: false, reason: 'mediaUrl no tiene un formato de URL válido' };
-  }
-
-  if (parsed.protocol !== 'https:') {
-    return { valid: false, reason: 'mediaUrl solo permite protocolo https://' };
-  }
-
-  const hostname = parsed.hostname.toLowerCase();
-  if (
-    hostname === 'localhost' ||
-    hostname === 'iapi-db' ||
-    hostname === 'iapi-postgres' ||
-    hostname === 'iapi-server' ||
-    hostname.endsWith('.local') ||
-    hostname.endsWith('.internal')
-  ) {
-    return { valid: false, reason: 'mediaUrl apunta a un host interno no permitido' };
-  }
-
-  if (net.isIP(hostname)) {
-    if (isPrivateOrReservedIp(hostname)) {
-      return { valid: false, reason: 'mediaUrl no puede apuntar a direcciones IP privadas o locales' };
-    }
-    return { valid: true };
-  }
-
-  try {
-    const records = await dns.lookup(hostname, { all: true });
-    for (const rec of records) {
-      if (isPrivateOrReservedIp(rec.address)) {
-        return { valid: false, reason: 'mediaUrl resuelve a una dirección IP privada o interna bloqueada' };
-      }
-    }
-  } catch {
-    return { valid: false, reason: 'No se pudo resolver el dominio de mediaUrl' };
-  }
-
-  return { valid: true };
-}
 
 // Rutas para encolado asíncrono de mensajes, consulta de estado y purgado de datos
 export async function messageRoutes(app: FastifyInstance): Promise<void> {
@@ -167,6 +85,14 @@ export async function messageRoutes(app: FastifyInstance): Promise<void> {
       }
 
       if (body.payload.mediaUrl) {
+        if (!env.allowMediaUrl) {
+          return reply.code(400).send({
+            status: 400,
+            success: false,
+            message: 'payload.mediaUrl está desactivado en este servidor (ALLOW_MEDIA_URL=false). Envíe payload.mediaBase64'
+          });
+        }
+
         const urlCheck = await validateSafeMediaUrl(body.payload.mediaUrl);
         if (!urlCheck.valid) {
           return reply.code(400).send({

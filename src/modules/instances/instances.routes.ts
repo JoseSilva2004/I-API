@@ -75,6 +75,18 @@ export async function instanceRoutes(app: FastifyInstance): Promise<void> {
     });
   });
 
+  // 2b. Desvincular el número de WhatsApp del proyecto (cierra sesión y borra credenciales)
+  app.post('/api/v1/instances/logout', { preHandler: [requireApiKey] }, async (request, reply) => {
+    const result = await whatsappAdapter.logout(request.tenant!.id);
+    return reply.code(200).send({
+      status: 200,
+      success: true,
+      project: request.tenant!.name,
+      message: 'Número de WhatsApp desvinculado',
+      data: result
+    });
+  });
+
   // 3. Consultar estado de conexión de los canales del proyecto
   app.get('/api/v1/instances/status', { preHandler: [requireApiKey] }, async (request, reply) => {
     const tenantId = request.tenant!.id;

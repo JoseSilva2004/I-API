@@ -46,16 +46,32 @@ export function hashApiKey(rawKey: string): string {
   return `sha256:${crypto.createHash('sha256').update(rawKey).digest('hex')}`;
 }
 
+// Solo compara contra el hash: el valor guardado en la base de datos nunca sirve como llave
 export async function findTenantByApiKey(rawKey: string) {
-  const hashed = hashApiKey(rawKey);
-  const tenant = await prisma.tenant.findFirst({
-    where: {
-      isActive: true,
-      OR: [{ apiKey: hashed }, { apiKey: rawKey }]
-    }
+  return prisma.tenant.findFirst({
+    where: { isActive: true, apiKey: hashApiKey(rawKey) }
   });
-  return tenant;
 }
+
+// Convierte a hash las llaves que quedaron en texto plano de versiones anteriores (se ejecuta al arrancar)
+export async function migrateLegacyApiKeys(): Promise<number> {
+  const legacy = await prisma.tenant.findMany({
+    where: { NOT: { apiKey: { startsWith: 'sha256:' } } },
+    select: { id: true, apiKey: true }
+  });
+  for (const t of legacy) {
+    await prisma.tenant.update({ where: { id: t.id }, data: { apiKey: hashApiKey(t.apiKey) } });
+  }
+  return legacy.length;
+}
+
+// Limpia del mapa las IPs cuya ventana ya venció para que no crezca indefinidamente
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of failedAttempts) {
+    if (now >= entry.resetAt) failedAttempts.delete(ip);
+  }
+}, WINDOW_MS).unref();
 
 // Genera un token temporal firmado (10 min) para la vista del QR sin exponer la API Key en el historial/refresh
 export function createQrViewToken(tenantId: string): string {
