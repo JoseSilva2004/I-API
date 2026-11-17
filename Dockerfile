@@ -17,5 +17,7 @@ RUN npx prisma generate && npm run build
 
 EXPOSE 3100
 
-# Ejecución compilada con margen de memoria seguro para PDFs Base64 de hasta 25MB
-CMD ["sh", "-c", "npx prisma db push --skip-generate && node --max-old-space-size=384 dist/server.js"]
+# Migraciones versionadas (prisma migrate deploy) y arranque con margen de memoria para PDFs Base64 de hasta 25MB
+COPY docker-entrypoint.sh ./
+RUN tr -d '\r' < docker-entrypoint.sh > entrypoint.tmp && mv entrypoint.tmp docker-entrypoint.sh && chmod +x docker-entrypoint.sh
+CMD ["./docker-entrypoint.sh"]

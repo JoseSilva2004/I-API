@@ -22,6 +22,8 @@ export const env = {
   burstDelayMaxMs: Number(process.env.BURST_DELAY_MAX_MS || 45000),
   autoReadMessages: process.env.AUTO_READ_MESSAGES === 'true',
   humanizeMessages: process.env.HUMANIZE_MESSAGES === 'true',
+  allowMediaUrl: process.env.ALLOW_MEDIA_URL !== 'false',
+  trustProxy: process.env.TRUST_PROXY === 'true',
   adminTelegramBotToken: process.env.ADMIN_TELEGRAM_BOT_TOKEN || '',
   adminTelegramChatId: process.env.ADMIN_TELEGRAM_CHAT_ID || ''
 };

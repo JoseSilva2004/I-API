@@ -11,6 +11,8 @@ import { prisma } from '../../config/prisma.js';
 import { IMessageProvider, SendMessageOptions } from '../provider.interface.js';
 import { usePostgresAuthState } from './postgres.auth.js';
 import { telegramAdapter } from '../telegram/telegram.adapter.js';
+import { formatMessageContent } from '../../utils/message-format.js';
+import { fetchSafeMedia } from '../../utils/safe-url.js';
 
 interface InstanceSession {
   socket: WASocket;
@@ -30,36 +32,84 @@ const MAX_RECONNECT_ATTEMPTS = 12;
 const randomInt = (min: number, max: number): number =>
   Math.floor(Math.random() * (max - min + 1)) + min;
 
-// Procesa Spintax {Hola|Buen día} (solo si contiene '|') y añade referencia anti-hash solo si humanize está activo
-function formatMessageContent(text?: string, humanize = false, messageId?: string): string {
-  if (!text) return '';
-  const spun = text.replace(/\{([^{}|]+\|[^{}]+)\}/g, (_, options: string) => {
-    const parts = options.split('|');
-    return parts[randomInt(0, parts.length - 1)];
-  });
-
-  if (!humanize) {
-    return spun;
-  }
-
-  const shortRef = (messageId || Math.random().toString(36).substring(2, 6)).slice(0, 4).toUpperCase();
-  return `${spun}\n\n_Ref: #${shortRef}_`;
-}
+type ConnectResult = { status: string; qrBase64?: string; pairingCode?: string };
 
 // Motor de WhatsApp Multi-Instancia con reconexión inteligente (backoff exponencial) y soporte QR / Pairing Code
 export class WhatsAppAdapter implements IMessageProvider {
   private sessions = new Map<string, InstanceSession>();
+  // Conexiones en curso por proyecto: las peticiones simultáneas comparten la misma en lugar de abrir otro socket
+  private connecting = new Map<string, Promise<ConnectResult>>();
+  private shuttingDown = false;
 
   // Inicia o recupera una sesión de WhatsApp para un proyecto (Tenant) sin duplicar sockets
-  async connectInstance(
+  connectInstance(tenantId: string, phoneForPairingCode?: string, forceNewSocket = false): Promise<ConnectResult> {
+    if (this.shuttingDown) {
+      return Promise.resolve({ status: 'DISCONNECTED' });
+    }
+
+    const pending = this.connecting.get(tenantId);
+    if (pending && !forceNewSocket) {
+      return pending;
+    }
+
+    const attempt = this.openConnection(tenantId, phoneForPairingCode, forceNewSocket).finally(() => {
+      if (this.connecting.get(tenantId) === attempt) this.connecting.delete(tenantId);
+    });
+    this.connecting.set(tenantId, attempt);
+    return attempt;
+  }
+
+  // Desvincula el número: cierra la sesión en WhatsApp (el teléfono lo quita de "Dispositivos vinculados")
+  // y borra las credenciales guardadas. La próxima conexión pedirá un QR nuevo.
+  async logout(tenantId: string): Promise<{ status: string }> {
+    const session = this.sessions.get(tenantId);
+    this.connecting.delete(tenantId);
+    this.sessions.delete(tenantId);
+
+    if (session) {
+      if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
+      session.socket.ev.removeAllListeners('connection.update');
+      session.socket.ev.removeAllListeners('creds.update');
+      session.socket.ev.removeAllListeners('messages.upsert');
+      if (session.status === 'CONNECTED') {
+        try {
+          await session.socket.logout();
+        } catch (err) {
+          console.error(`[WhatsApp:${tenantId}] Error cerrando sesión en WhatsApp:`, err);
+        }
+      }
+      try {
+        session.socket.end(undefined);
+      } catch {
+        // Ignorar errores al cerrar
+      }
+    }
+
+    await prisma.sessionCreds.deleteMany({ where: { tenantId, channel: 'WHATSAPP' } });
+    console.log(`[WhatsApp:${tenantId}] Sesión desvinculada y credenciales eliminadas`);
+    return { status: 'DISCONNECTED' };
+  }
+
+  // Cierra todos los sockets sin cerrar sesión en WhatsApp (las credenciales siguen en PostgreSQL)
+  shutdown(): void {
+    this.shuttingDown = true;
+    for (const session of this.sessions.values()) {
+      if (session.reconnectTimer) clearTimeout(session.reconnectTimer);
+      try {
+        session.socket.ev.removeAllListeners('connection.update');
+        session.socket.end(undefined);
+      } catch {
+        // Ignorar errores al cerrar
+      }
+    }
+    this.sessions.clear();
+  }
+
+  private async openConnection(
     tenantId: string,
     phoneForPairingCode?: string,
     forceNewSocket = false
-  ): Promise<{
-    status: string;
-    qrBase64?: string;
-    pairingCode?: string;
-  }> {
+  ): Promise<ConnectResult> {
     const existing = this.sessions.get(tenantId);
 
     if (!forceNewSocket && existing && existing.status !== 'DISCONNECTED') {
@@ -292,6 +342,13 @@ export class WhatsAppAdapter implements IMessageProvider {
     };
   }
 
+  // Descarga el archivo indicado en mediaUrl justo antes de enviarlo (validación anti-SSRF en ese momento)
+  private async downloadMedia(mediaUrl?: string): Promise<Buffer> {
+    if (!mediaUrl) throw new Error('INVALID_MEDIA_URL: el mensaje no tiene mediaBase64 ni mediaUrl');
+    if (!env.allowMediaUrl) throw new Error('INVALID_MEDIA_URL: mediaUrl está desactivado en este servidor');
+    return fetchSafeMedia(mediaUrl);
+  }
+
   // Envía mensaje o documento con tiempo de escritura proporcional
   async send(options: SendMessageOptions): Promise<{ externalId?: string }> {
     const { messageId, tenantId, recipient, type, payload } = options;
@@ -341,7 +398,7 @@ export class WhatsAppAdapter implements IMessageProvider {
     if (type === 'DOCUMENT') {
       const buffer = payload.mediaBase64
         ? Buffer.from(payload.mediaBase64, 'base64')
-        : { url: payload.mediaUrl || '' };
+        : await this.downloadMedia(payload.mediaUrl);
 
       const sent = await session.socket.sendMessage(jid, {
         document: buffer,
@@ -355,7 +412,7 @@ export class WhatsAppAdapter implements IMessageProvider {
     if (type === 'IMAGE') {
       const buffer = payload.mediaBase64
         ? Buffer.from(payload.mediaBase64, 'base64')
-        : { url: payload.mediaUrl || '' };
+        : await this.downloadMedia(payload.mediaUrl);
 
       const sent = await session.socket.sendMessage(jid, {
         image: buffer,

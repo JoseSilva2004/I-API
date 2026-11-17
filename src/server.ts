@@ -2,7 +2,8 @@ import crypto from 'crypto';
 import Fastify from 'fastify';
 import { env } from './config/env.js';
 import { prisma } from './config/prisma.js';
-import { hashApiKey } from './middlewares/auth.middleware.js';
+import { hashApiKey, migrateLegacyApiKeys } from './middlewares/auth.middleware.js';
+import { redactUrl } from './utils/message-format.js';
 import { instanceRoutes } from './modules/instances/instances.routes.js';
 import { messageRoutes } from './modules/messages/messages.routes.js';
 import { whatsappAdapter } from './providers/whatsapp/baileys.adapter.js';
@@ -11,8 +12,18 @@ import { cleanupWorker } from './workers/cleanup.worker.js';
 
 const app = Fastify({
   logger: {
-    level: env.nodeEnv === 'production' ? 'info' : 'warn'
+    level: env.nodeEnv === 'production' ? 'info' : 'warn',
+    serializers: {
+      // La URL de la página del QR puede llevar ?apiKey= o ?token=: se ocultan antes de escribir el log
+      req: (req: { method: string; url: string; ip?: string }) => ({
+        method: req.method,
+        url: redactUrl(req.url),
+        remoteAddress: req.ip
+      })
+    }
   },
+  // Detrás de nginx u otro proxy, toma la IP real del cliente (necesario para el límite de intentos)
+  trustProxy: env.trustProxy,
   bodyLimit: 25 * 1024 * 1024 // Permite PDFs e imágenes en Base64 de hasta 25MB
 });
 
@@ -24,8 +35,8 @@ app.get('/health', async () => ({
 
 // Crea un proyecto inicial con llave aleatoria en el primer arranque (o rota la llave insegura por defecto si existía)
 async function ensureDefaultTenant(): Promise<void> {
-  const insecureTenant = await prisma.tenant.findUnique({
-    where: { apiKey: 'iapi_default_key_2026' }
+  const insecureTenant = await prisma.tenant.findFirst({
+    where: { apiKey: { in: ['iapi_default_key_2026', hashApiKey('iapi_default_key_2026')] } }
   });
 
   if (insecureTenant) {
@@ -64,8 +75,9 @@ async function ensureDefaultTenant(): Promise<void> {
 async function setupGracefulShutdown(): Promise<void> {
   const shutdown = async (signal: string) => {
     console.log(`[I-API] Señal ${signal} recibida. Cerrando workers y conexiones ordenadamente...`);
-    queueWorker.stop();
     cleanupWorker.stop();
+    await queueWorker.stop();
+    whatsappAdapter.shutdown();
     await app.close();
     await prisma.$disconnect();
     process.exit(0);
@@ -79,6 +91,10 @@ async function bootstrap(): Promise<void> {
   try {
     await prisma.$connect();
     await ensureDefaultTenant();
+    const migratedKeys = await migrateLegacyApiKeys();
+    if (migratedKeys > 0) {
+      console.log(`[I-API] ${migratedKeys} API Key(s) en texto plano convertidas a hash SHA-256.`);
+    }
 
     await app.register(instanceRoutes);
     await app.register(messageRoutes);

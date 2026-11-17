@@ -8,7 +8,10 @@
     "build": "tsc",
     "start": "node dist/server.js",
     "prisma:generate": "prisma generate",
-    "prisma:push": "prisma db push"
+    "prisma:push": "prisma db push",
+    "test:unit": "node --import tsx --test tests/unit/*.test.ts",
+    "test:smoke": "node --test tests/smoke/*.test.mjs",
+    "prisma:migrate": "prisma migrate deploy"
   },
   "dependencies": {
     "@prisma/client": "5.22.0",
@@ -27,4 +30,3 @@
     "typescript": "5.9.3"
   }
 }
-

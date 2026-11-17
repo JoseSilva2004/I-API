@@ -22,8 +22,10 @@ services:
     container_name: iapi-server
     restart: unless-stopped
     mem_limit: 512m
+    stop_grace_period: 30s
     ports:
-      - "3100:3100"
+      # Por defecto solo accesible desde el propio servidor; para exponerla use un proxy con TLS
+      - "${IAPI_BIND_ADDRESS:-127.0.0.1}:3100:3100"
     env_file:
       - .env
     environment:

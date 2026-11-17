@@ -48,7 +48,8 @@ export class QueueWorker {
     }, 60 * 1000);
   }
 
-  stop(): void {
+  // Detiene la cola y espera (hasta 20 s) a que termine el envío en curso para no dejarlo en PROCESSING
+  async stop(maxWaitMs = 20000): Promise<void> {
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = undefined;
@@ -56,6 +57,10 @@ export class QueueWorker {
     if (this.recoveryTimer) {
       clearInterval(this.recoveryTimer);
       this.recoveryTimer = undefined;
+    }
+    const deadline = Date.now() + maxWaitMs;
+    while (this.isRunning && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 250));
     }
   }
 
@@ -252,7 +257,8 @@ export class QueueWorker {
       }
 
       // Si el número no existe en WhatsApp o alcanzó los 3 intentos, marca como FAILED definitivo
-      const isPermanentError = errMsg.startsWith('INVALID_WHATSAPP_NUMBER') || msg.attempts >= 3;
+      const isPermanentError =
+        errMsg.startsWith('INVALID_WHATSAPP_NUMBER') || errMsg.startsWith('INVALID_MEDIA_URL') || msg.attempts >= 3;
       await prisma.messageQueue.update({
         where: { id: msg.id },
         data: {
