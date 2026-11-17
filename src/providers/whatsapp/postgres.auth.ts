@@ -3,9 +3,10 @@ import {
   AuthenticationState,
   BufferJSON,
   initAuthCreds,
-   proto,
+  proto,
   SignalDataTypeMap
 } from '@whiskeysockets/baileys';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../../config/prisma.js';
 
 // Reemplazo transaccional de useMultiFileAuthState sobre PostgreSQL (Evita corrupción de llaves Signal)
@@ -14,8 +15,10 @@ export async function usePostgresAuthState(tenantId: string): Promise<{
   saveCreds: () => Promise<void>;
   clearSession: () => Promise<void>;
 }> {
+  const serialize = (data: unknown) => JSON.parse(JSON.stringify(data, BufferJSON.replacer));
+
   const writeData = async (keyId: string, data: unknown) => {
-    const serialized = JSON.parse(JSON.stringify(data, BufferJSON.replacer));
+    const serialized = serialize(data);
     await prisma.sessionCreds.upsert({
       where: {
         tenantId_channel_keyId: { tenantId, channel: 'WHATSAPP', keyId }
@@ -33,12 +36,6 @@ export async function usePostgresAuthState(tenantId: string): Promise<{
     });
     if (!row || !row.data) return null;
     return JSON.parse(JSON.stringify(row.data), BufferJSON.reviver);
-  };
-
-  const removeData = async (keyId: string) => {
-    await prisma.sessionCreds.deleteMany({
-      where: { tenantId, channel: 'WHATSAPP', keyId }
-    });
   };
 
   const creds: AuthenticationCreds = (await readData('creds')) || initAuthCreds();
@@ -61,7 +58,7 @@ export async function usePostgresAuthState(tenantId: string): Promise<{
           return data;
         },
         set: async (data) => {
-          const tasks: Promise<void>[] = [];
+          const operations: Prisma.PrismaPromise<unknown>[] = [];
           for (const category in data) {
             const catKey = category as keyof SignalDataTypeMap;
             const categoryData = data[catKey];
@@ -70,10 +67,29 @@ export async function usePostgresAuthState(tenantId: string): Promise<{
             for (const id in categoryData) {
               const value = categoryData[id];
               const keyId = `${category}-${id}`;
-              tasks.push(value ? writeData(keyId, value) : removeData(keyId));
+              if (value) {
+                const serialized = serialize(value);
+                operations.push(
+                  prisma.sessionCreds.upsert({
+                    where: {
+                      tenantId_channel_keyId: { tenantId, channel: 'WHATSAPP', keyId }
+                    },
+                    create: { tenantId, channel: 'WHATSAPP', keyId, data: serialized },
+                    update: { data: serialized }
+                  })
+                );
+              } else {
+                operations.push(
+                  prisma.sessionCreds.deleteMany({
+                    where: { tenantId, channel: 'WHATSAPP', keyId }
+                  })
+                );
+              }
             }
           }
-          await Promise.all(tasks);
+          if (operations.length > 0) {
+            await prisma.$transaction(operations);
+          }
         }
       }
     },
@@ -85,4 +101,3 @@ export async function usePostgresAuthState(tenantId: string): Promise<{
     }
   };
 }
-

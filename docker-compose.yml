@@ -21,7 +21,7 @@ services:
     build: .
     container_name: iapi-server
     restart: unless-stopped
-    mem_limit: 220m
+    mem_limit: 512m
     ports:
       - "3100:3100"
     env_file:
@@ -31,10 +31,6 @@ services:
     depends_on:
       iapi-db:
         condition: service_healthy
-    volumes:
-      - ./src:/app/src
-      - ./prisma:/app/prisma
 
 volumes:
   iapi_pgdata:
-

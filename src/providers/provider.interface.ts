@@ -5,9 +5,11 @@ export interface MessagePayload {
   mediaBase64?: string;
   fileName?: string;
   mimeType?: string;
+  humanize?: boolean;
 }
 
 export interface SendMessageOptions {
+  messageId?: string;
   tenantId: string;
   recipient: string;
   type: 'TEXT' | 'DOCUMENT' | 'IMAGE';
@@ -20,4 +22,3 @@ export interface IMessageProvider {
   send(options: SendMessageOptions): Promise<{ externalId?: string }>;
   getStatus(tenantId: string): Promise<{ status: string; details?: Record<string, unknown> }>;
 }
-

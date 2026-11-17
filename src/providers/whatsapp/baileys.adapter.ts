@@ -6,6 +6,7 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import QRCode from 'qrcode';
+import { env } from '../../config/env.js';
 import { prisma } from '../../config/prisma.js';
 import { IMessageProvider, SendMessageOptions } from '../provider.interface.js';
 import { usePostgresAuthState } from './postgres.auth.js';
@@ -17,40 +18,82 @@ interface InstanceSession {
   qrBase64?: string;
   pairingCode?: string;
   phoneNumber?: string;
+  reconnectAttempts: number;
+  reconnectTimer?: NodeJS.Timeout;
 }
 
-const logger = pino({ level: 'silent' });
+const logger = pino({ level: 'silent' }) as unknown as NonNullable<
+  Parameters<typeof makeWASocket>[0]['logger']
+>;
+const MAX_RECONNECT_ATTEMPTS = 12;
 
 const randomInt = (min: number, max: number): number =>
   Math.floor(Math.random() * (max - min + 1)) + min;
 
-// Polimorfismo de texto: resuelve Spintax {Hola|Buen día} y añade micro-referencia única anti-hash
-function humanizeContent(text?: string, messageId?: string): string {
+// Procesa Spintax {Hola|Buen día} (solo si contiene '|') y añade referencia anti-hash solo si humanize está activo
+function formatMessageContent(text?: string, humanize = false, messageId?: string): string {
   if (!text) return '';
-  const spun = text.replace(/\{([^{}]+)\}/g, (_, options: string) => {
+  const spun = text.replace(/\{([^{}|]+\|[^{}]+)\}/g, (_, options: string) => {
     const parts = options.split('|');
     return parts[randomInt(0, parts.length - 1)];
   });
+
+  if (!humanize) {
+    return spun;
+  }
+
   const shortRef = (messageId || Math.random().toString(36).substring(2, 6)).slice(0, 4).toUpperCase();
   return `${spun}\n\n_Ref: #${shortRef}_`;
 }
 
-// Motor de WhatsApp Multi-Instancia con reconexión inteligente y soporte QR / Pairing Code
+// Motor de WhatsApp Multi-Instancia con reconexión inteligente (backoff exponencial) y soporte QR / Pairing Code
 export class WhatsAppAdapter implements IMessageProvider {
   private sessions = new Map<string, InstanceSession>();
 
-  // Inicia o recupera una sesión de WhatsApp para un proyecto (Tenant)
+  // Inicia o recupera una sesión de WhatsApp para un proyecto (Tenant) sin duplicar sockets
   async connectInstance(
     tenantId: string,
-    phoneForPairingCode?: string
+    phoneForPairingCode?: string,
+    forceNewSocket = false
   ): Promise<{
     status: string;
     qrBase64?: string;
     pairingCode?: string;
   }> {
     const existing = this.sessions.get(tenantId);
-    if (existing && existing.status === 'CONNECTED') {
-      return { status: 'CONNECTED' };
+
+    if (!forceNewSocket && existing && existing.status !== 'DISCONNECTED') {
+      if (existing.status === 'CONNECTED') {
+        return { status: 'CONNECTED' };
+      }
+
+      if (phoneForPairingCode && !existing.pairingCode && existing.status === 'QR_READY') {
+        try {
+          const cleanPhone = phoneForPairingCode.replace(/\D/g, '');
+          existing.pairingCode = await existing.socket.requestPairingCode(cleanPhone);
+        } catch (err) {
+          console.error(`[WhatsApp:${tenantId}] Error generando Pairing Code:`, err);
+        }
+      }
+
+      return {
+        status: existing.status,
+        qrBase64: existing.qrBase64,
+        pairingCode: existing.pairingCode
+      };
+    }
+
+    // Si había un socket anterior, cerrarlo limpiamente antes de crear uno nuevo
+    if (existing) {
+      if (existing.reconnectTimer) clearTimeout(existing.reconnectTimer);
+      try {
+        existing.socket.ev.removeAllListeners('connection.update');
+        existing.socket.ev.removeAllListeners('creds.update');
+        existing.socket.ev.removeAllListeners('messages.upsert');
+        existing.socket.end(undefined);
+      } catch {
+        // Ignorar errores al cerrar socket obsoleto
+      }
     }
 
     const { state, saveCreds, clearSession } = await usePostgresAuthState(tenantId);
@@ -71,28 +114,31 @@ export class WhatsAppAdapter implements IMessageProvider {
 
     const instanceState: InstanceSession = {
       socket: sock,
-      status: 'CONNECTING'
+      status: 'CONNECTING',
+      reconnectAttempts: existing?.reconnectAttempts || 0
     };
     this.sessions.set(tenantId, instanceState);
 
     sock.ev.on('creds.update', saveCreds);
 
-    // Auto-Read: marca como leídos los mensajes entrantes tras 3-8s para mejorar el Trust Score ante Meta
-    sock.ev.on('messages.upsert', async ({ messages, type }) => {
-      if (type !== 'notify') return;
-      for (const msg of messages) {
-        if (!msg.key.fromMe && msg.key.remoteJid && msg.key.remoteJid !== 'status@broadcast') {
-          const readDelayMs = randomInt(3000, 8000);
-          setTimeout(async () => {
-            try {
-              await sock.readMessages([msg.key]);
-            } catch {
-              // Ignorar si el socket se cerró durante la espera
-            }
-          }, readDelayMs);
+    // Auto-Read opcional (desactivado por defecto para no marcar como leídos mensajes de pacientes sin leer)
+    if (env.autoReadMessages) {
+      sock.ev.on('messages.upsert', async ({ messages, type }) => {
+        if (type !== 'notify') return;
+        for (const msg of messages) {
+          if (!msg.key.fromMe && msg.key.remoteJid && msg.key.remoteJid !== 'status@broadcast') {
+            const readDelayMs = randomInt(3000, 8000);
+            setTimeout(async () => {
+              try {
+                await sock.readMessages([msg.key]);
+              } catch {
+                // Ignorar si el socket se cerró durante la espera
+              }
+            }, readDelayMs);
+          }
         }
-      }
-    });
+      });
+    }
 
     // Promesa para capturar el primer QR o Pairing Code sin bloquear indefinidamente
     return new Promise((resolve) => {
@@ -131,6 +177,7 @@ export class WhatsAppAdapter implements IMessageProvider {
           instanceState.status = 'CONNECTED';
           instanceState.qrBase64 = undefined;
           instanceState.pairingCode = undefined;
+          instanceState.reconnectAttempts = 0;
           instanceState.phoneNumber = sock.user?.id.split(':')[0];
           console.log(`[WhatsApp:${tenantId}] Sesión CONECTADA (${instanceState.phoneNumber})`);
           finish({ status: 'CONNECTED' });
@@ -138,25 +185,70 @@ export class WhatsAppAdapter implements IMessageProvider {
 
         if (connection === 'close') {
           const statusCode = (lastDisconnect?.error as { output?: { statusCode?: number } })?.output?.statusCode;
-          const isLoggedOut = statusCode === DisconnectReason.loggedOut;
 
-          if (isLoggedOut) {
+          // 1. Cierre de sesión explícito o sesión corrupta -> limpiar credenciales y alertar
+          if (
+            statusCode === DisconnectReason.loggedOut ||
+            statusCode === DisconnectReason.badSession ||
+            statusCode === DisconnectReason.multideviceMismatch
+          ) {
             instanceState.status = 'DISCONNECTED';
             this.sessions.delete(tenantId);
             await clearSession();
             await telegramAdapter.sendAdminAlert(
-              `⚠️ [I-API] La sesión de WhatsApp del proyecto ${tenantId} cerró sesión (loggedOut). Requiere revinculación.`
+              `⚠️ [I-API] Sesión de WhatsApp (${tenantId}) cerrada o corrupta (code: ${statusCode}). Requiere revinculación.`
             );
             finish({ status: 'DISCONNECTED' });
-          } else {
-            // Reconexión automática en cualquier corte de red o reinicio sin perder la sesión
-            console.log(`[WhatsApp:${tenantId}] Reconectando socket automáticamente (code: ${statusCode})...`);
-            setTimeout(() => {
-              this.connectInstance(tenantId).catch((e) =>
-                console.error(`[WhatsApp:${tenantId}] Fallo en reconexión:`, e)
-              );
-            }, 4000);
+            return;
           }
+
+          // 2. Número restringido (403) o sesión reemplazada en otro lugar (440) -> NO reconectar en bucle
+          if (
+            statusCode === DisconnectReason.forbidden ||
+            statusCode === DisconnectReason.connectionReplaced
+          ) {
+            instanceState.status = 'DISCONNECTED';
+            await telegramAdapter.sendAdminAlert(
+              `🚨 [I-API] Reconexión detenida para proyecto ${tenantId} (code: ${statusCode} - ${
+                statusCode === DisconnectReason.forbidden ? 'Forbidden/Restringido' : 'Connection Replaced'
+              }).`
+            );
+            finish({ status: 'DISCONNECTED' });
+            return;
+          }
+
+          // 3. Reinicio requerido por WhatsApp tras emparejar (515) -> reconexión inmediata
+          if (statusCode === DisconnectReason.restartRequired) {
+            console.log(`[WhatsApp:${tenantId}] Reinicio requerido tras vinculación (515), reconectando...`);
+            instanceState.reconnectTimer = setTimeout(() => {
+              this.connectInstance(tenantId, undefined, true).catch((e) =>
+                console.error(`[WhatsApp:${tenantId}] Fallo en reconexión 515:`, e)
+              );
+            }, 1000);
+            return;
+          }
+
+          // 4. Errores de red transitorios -> Backoff exponencial (4s, 8s, 16s... máx 5 min) con límite de intentos
+          instanceState.reconnectAttempts += 1;
+          if (instanceState.reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+            instanceState.status = 'DISCONNECTED';
+            await telegramAdapter.sendAdminAlert(
+              `⚠️ [I-API] Se alcanzó el límite de ${MAX_RECONNECT_ATTEMPTS} intentos de reconexión para ${tenantId} (último code: ${statusCode}).`
+            );
+            finish({ status: 'DISCONNECTED' });
+            return;
+          }
+
+          const backoffMs = Math.min(4000 * Math.pow(2, instanceState.reconnectAttempts - 1), 300000);
+          console.log(
+            `[WhatsApp:${tenantId}] Reconectando en ${Math.round(backoffMs / 1000)}s (intento ${instanceState.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS}, code: ${statusCode})...`
+          );
+
+          instanceState.reconnectTimer = setTimeout(() => {
+            this.connectInstance(tenantId, undefined, true).catch((e) =>
+              console.error(`[WhatsApp:${tenantId}] Fallo en reconexión:`, e)
+            );
+          }, backoffMs);
         }
       });
 
@@ -170,7 +262,7 @@ export class WhatsAppAdapter implements IMessageProvider {
     });
   }
 
-  // Restaura automáticamente todas las sesiones guardadas en PostgreSQL al arrancar Docker
+  // Restaura automáticamente todas las sesiones guardadas en PostgreSQL al arrancar
   async restoreAllSessions(): Promise<void> {
     const savedTenants = await prisma.sessionCreds.findMany({
       where: { channel: 'WHATSAPP', keyId: 'creds' },
@@ -200,9 +292,9 @@ export class WhatsAppAdapter implements IMessageProvider {
     };
   }
 
-  // Envía mensaje o documento con tiempo de escritura proporcional y huella polimórfica
+  // Envía mensaje o documento con tiempo de escritura proporcional
   async send(options: SendMessageOptions): Promise<{ externalId?: string }> {
-    const { tenantId, recipient, type, payload } = options;
+    const { messageId, tenantId, recipient, type, payload } = options;
     const session = this.sessions.get(tenantId);
 
     if (!session || session.status !== 'CONNECTED') {
@@ -220,10 +312,15 @@ export class WhatsAppAdapter implements IMessageProvider {
     const jid = check.jid;
     await session.socket.presenceSubscribe(jid);
 
+    const shouldHumanize = payload.humanize ?? env.humanizeMessages;
+
     if (type === 'TEXT') {
-      const finalText = humanizeContent(payload.text);
-      // Calcula tiempo de escritura humano (~50ms por carácter, mínimo 1.8s, máximo 8.5s + variación)
-      const baseTypingMs = Math.min(Math.max(finalText.length * 50, 1800), 8500);
+      const finalText = formatMessageContent(payload.text, shouldHumanize, messageId);
+      // Calcula tiempo de escritura humano (~50ms por carácter, acotado por FAST_TYPING_MIN_MS y FAST_TYPING_MAX_MS)
+      const baseTypingMs = Math.min(
+        Math.max(finalText.length * 50, env.fastTypingMinMs),
+        env.fastTypingMaxMs
+      );
       const typingMs = baseTypingMs + randomInt(200, 1100);
 
       await session.socket.sendPresenceUpdate('composing', jid);
@@ -236,9 +333,10 @@ export class WhatsAppAdapter implements IMessageProvider {
 
     // Para archivos (PDF/Imagen): pausa corta de adjuntado sin fingir escritura larga
     await new Promise((r) => setTimeout(r, randomInt(1200, 2400)));
-    const finalCaption = payload.caption || payload.text
-      ? humanizeContent(payload.caption || payload.text)
-      : undefined;
+    const finalCaption =
+      payload.caption || payload.text
+        ? formatMessageContent(payload.caption || payload.text, shouldHumanize, messageId)
+        : undefined;
 
     if (type === 'DOCUMENT') {
       const buffer = payload.mediaBase64
@@ -271,4 +369,3 @@ export class WhatsAppAdapter implements IMessageProvider {
 }
 
 export const whatsappAdapter = new WhatsAppAdapter();
-

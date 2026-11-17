@@ -1,7 +1,7 @@
 import { Prisma } from '@prisma/client';
 import { prisma } from '../config/prisma.js';
 
-// Worker de privacidad y ahorro de espacio: limpia el payload sensible tras 24h de enviado
+// Worker de privacidad y ahorro de espacio: limpia el payload sensible tras 24h en SENT/FAILED y expira PENDING > 7 días
 export class CleanupWorker {
   private timer?: NodeJS.Timeout;
 
@@ -13,25 +13,57 @@ export class CleanupWorker {
     }, 60 * 60 * 1000);
   }
 
-  async purgeOldPayloads(hoursOld = 24): Promise<number> {
-    const cutoff = new Date(Date.now() - hoursOld * 60 * 60 * 1000);
-    const result = await prisma.messageQueue.updateMany({
+  stop(): void {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+  }
+
+  async purgeOldPayloads(hoursOld = 24, tenantId?: string): Promise<number> {
+    const safeHours = Math.max(1, Number(hoursOld) || 24);
+    const cutoff = new Date(Date.now() - safeHours * 60 * 60 * 1000);
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+
+    const tenantFilter = tenantId ? { tenantId } : {};
+
+    // 1. Marcar como FAILED y vaciar payload de mensajes PENDING atascados por más de 7 días
+    const expiredPending = await prisma.messageQueue.updateMany({
       where: {
-        status: 'SENT',
-        sentAt: { lte: cutoff },
-        payload: { not: Prisma.DbNull }
+        ...tenantFilter,
+        status: 'PENDING',
+        createdAt: { lte: sevenDaysAgo }
+      },
+      data: {
+        status: 'FAILED',
+        errorReason: 'Expirado tras 7 días sin poder despacharse',
+        payload: Prisma.DbNull
+      }
+    });
+
+    // 2. Vaciar el payload sensible de mensajes SENT o FAILED antiguos (> hoursOld)
+    const purged = await prisma.messageQueue.updateMany({
+      where: {
+        ...tenantFilter,
+        payload: { not: Prisma.DbNull },
+        OR: [
+          { status: 'SENT', sentAt: { lte: cutoff } },
+          { status: 'FAILED', createdAt: { lte: cutoff } }
+        ]
       },
       data: {
         payload: Prisma.DbNull
       }
     });
 
-    if (result.count > 0) {
-      console.log(`[CleanupWorker] Contenido purgado en ${result.count} mensajes enviados (> ${hoursOld}h)`);
+    const total = expiredPending.count + purged.count;
+    if (total > 0) {
+      console.log(
+        `[CleanupWorker] Contenido purgado en ${total} mensajes (> ${safeHours}h${tenantId ? `, tenant: ${tenantId}` : ''})`
+      );
     }
-    return result.count;
+    return total;
   }
 }
 
 export const cleanupWorker = new CleanupWorker();
-

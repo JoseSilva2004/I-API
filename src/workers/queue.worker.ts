@@ -19,18 +19,64 @@ interface QueuedMessageRow {
 const randomBetween = (min: number, max: number): number =>
   Math.floor(Math.random() * (max - min + 1)) + min;
 
-// Motor de cola con PostgreSQL SKIP LOCKED, Prioridad y Enfriamiento Adaptativo Anti-Baneo
+const STUCK_LOCK_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutos
+
+// Motor de cola con PostgreSQL SKIP LOCKED, Prioridad, Recuperación de Bloqueos y Enfriamiento Anti-Baneo
 export class QueueWorker {
   private isRunning = false;
   private timer?: NodeJS.Timeout;
+  private recoveryTimer?: NodeJS.Timeout;
   private burstCounters = new Map<string, number>();
 
   start(): void {
     if (this.timer) return;
-    console.log('[QueueWorker] Motor de cola iniciado (Modo Adaptativo: 3-4s libre / 20-45s ráfaga)');
+    console.log('[QueueWorker] Motor de cola iniciado (Modo Adaptativo + Recuperación de PROCESSING)');
+
+    // Recuperar de inmediato cualquier mensaje que haya quedado en PROCESSING tras un reinicio abrupto
+    this.recoverStuckMessages().catch((err) =>
+      console.error('[QueueWorker] Error recuperando mensajes atascados al iniciar:', err)
+    );
+
     this.timer = setInterval(() => {
       this.processNextBatch().catch((err) => console.error('[QueueWorker] Error en ciclo:', err));
     }, 1500);
+
+    this.recoveryTimer = setInterval(() => {
+      this.recoverStuckMessages().catch((err) =>
+        console.error('[QueueWorker] Error en recuperación periódica:', err)
+      );
+    }, 60 * 1000);
+  }
+
+  stop(): void {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+    if (this.recoveryTimer) {
+      clearInterval(this.recoveryTimer);
+      this.recoveryTimer = undefined;
+    }
+  }
+
+  // Devuelve a PENDING los mensajes que llevan más de 5 minutos atascados en PROCESSING
+  async recoverStuckMessages(): Promise<void> {
+    const expiredLock = new Date(Date.now() - STUCK_LOCK_TIMEOUT_MS);
+    const recovered = await prisma.messageQueue.updateMany({
+      where: {
+        status: 'PROCESSING',
+        OR: [{ lockedAt: { lte: expiredLock } }, { lockedAt: null }]
+      },
+      data: {
+        status: 'PENDING',
+        lockedAt: null,
+        errorReason: 'Recuperado automáticamente tras reinicio o timeout de procesamiento'
+      }
+    });
+
+    if (recovered.count > 0) {
+      console.warn(`[QueueWorker] Se recuperaron ${recovered.count} mensajes atascados en PROCESSING.`);
+    }
   }
 
   private async processNextBatch(): Promise<void> {
@@ -58,10 +104,17 @@ export class QueueWorker {
         const msg = rows[0];
         await tx.messageQueue.update({
           where: { id: msg.id },
-          data: { status: 'PROCESSING', attempts: { increment: 1 } }
+          data: {
+            status: 'PROCESSING',
+            lockedAt: new Date(),
+            attempts: { increment: 1 }
+          }
         });
 
-        return msg;
+        return {
+          ...msg,
+          attempts: msg.attempts + 1
+        };
       });
 
       if (!claimed) return;
@@ -77,7 +130,11 @@ export class QueueWorker {
     if (!tenant || !tenant.isActive) {
       await prisma.messageQueue.update({
         where: { id: msg.id },
-        data: { status: 'FAILED', errorReason: 'Proyecto inactivo o inexistente' }
+        data: {
+          status: 'FAILED',
+          lockedAt: null,
+          errorReason: 'Proyecto inactivo o inexistente'
+        }
       });
       return;
     }
@@ -104,11 +161,14 @@ export class QueueWorker {
             where: { id: msg.id },
             data: {
               status: 'PENDING',
+              lockedAt: null,
               attempts: { decrement: 1 },
               scheduledAt: new Date(now + coffeeBreakMs)
             }
           });
-          console.log(`[QueueWorker] Pausa humana anti-baneo activada (${Math.round(coffeeBreakMs / 1000)}s) tras ${currentBurst} envíos.`);
+          console.log(
+            `[QueueWorker] Pausa humana anti-baneo activada (${Math.round(coffeeBreakMs / 1000)}s) tras ${currentBurst} envíos.`
+          );
           return;
         }
 
@@ -122,6 +182,7 @@ export class QueueWorker {
             where: { id: msg.id },
             data: {
               status: 'PENDING',
+              lockedAt: null,
               attempts: { decrement: 1 },
               scheduledAt: nextSchedule
             }
@@ -130,6 +191,7 @@ export class QueueWorker {
         }
 
         await whatsappAdapter.send({
+          messageId: msg.id,
           tenantId: msg.tenant_id,
           recipient: msg.recipient,
           type: msg.type,
@@ -142,7 +204,7 @@ export class QueueWorker {
         await prisma.$transaction([
           prisma.messageQueue.update({
             where: { id: msg.id },
-            data: { status: 'SENT', sentAt: sentTime, errorReason: null }
+            data: { status: 'SENT', lockedAt: null, sentAt: sentTime, errorReason: null }
           }),
           prisma.tenant.update({
             where: { id: msg.tenant_id },
@@ -156,6 +218,7 @@ export class QueueWorker {
 
       if (msg.channel === 'TELEGRAM') {
         await telegramAdapter.send({
+          messageId: msg.id,
           tenantId: msg.tenant_id,
           recipient: msg.recipient,
           type: msg.type,
@@ -164,7 +227,7 @@ export class QueueWorker {
 
         await prisma.messageQueue.update({
           where: { id: msg.id },
-          data: { status: 'SENT', sentAt: new Date(), errorReason: null }
+          data: { status: 'SENT', lockedAt: null, sentAt: new Date(), errorReason: null }
         });
 
         console.log(`[QueueWorker] Telegram ENVIADO (id: ${msg.id})`);
@@ -172,13 +235,15 @@ export class QueueWorker {
     } catch (error) {
       const errMsg = (error as Error).message || 'Error desconocido';
 
-      // Si la sesión de WhatsApp no está conectada aún, mantiene en PENDING sin perder el mensaje
+      // Si la sesión de WhatsApp no está conectada aún, mantiene en PENDING sin gastar intentos de envío
       if (errMsg === 'SESSION_NOT_CONNECTED') {
         const retryAt = new Date(Date.now() + 20000);
         await prisma.messageQueue.update({
           where: { id: msg.id },
           data: {
             status: 'PENDING',
+            lockedAt: null,
+            attempts: { decrement: 1 },
             errorReason: 'Esperando conexión de sesión WhatsApp',
             scheduledAt: retryAt
           }
@@ -186,21 +251,21 @@ export class QueueWorker {
         return;
       }
 
-      // Si el número no existe en WhatsApp o superó 3 intentos, marca como FAILED definitivo
+      // Si el número no existe en WhatsApp o alcanzó los 3 intentos, marca como FAILED definitivo
       const isPermanentError = errMsg.startsWith('INVALID_WHATSAPP_NUMBER') || msg.attempts >= 3;
       await prisma.messageQueue.update({
         where: { id: msg.id },
         data: {
           status: isPermanentError ? 'FAILED' : 'PENDING',
+          lockedAt: null,
           errorReason: errMsg,
           scheduledAt: new Date(Date.now() + 30000)
         }
       });
 
-      console.warn(`[QueueWorker] Fallo en mensaje ${msg.id}: ${errMsg}`);
+      console.warn(`[QueueWorker] Fallo en mensaje ${msg.id} (intento ${msg.attempts}/3): ${errMsg}`);
     }
   }
 }
 
 export const queueWorker = new QueueWorker();
-

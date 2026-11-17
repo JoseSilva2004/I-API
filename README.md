@@ -9,9 +9,9 @@ API REST Multi-Proyecto (*Multi-Tenant*) construida con **Node.js, TypeScript, F
 - **Persistencia Criptográfica en PostgreSQL (`session_creds`)**: Reemplaza los archivos JSON sueltos por almacenamiento transaccional en `JSONB`, evitando la corrupción de llaves *Signal* y cierres de sesión inesperados.
 - **Cola Inteligente con `FOR UPDATE SKIP LOCKED`**: No requiere Redis ni RabbitMQ. Soporta niveles de prioridad (`HIGH` | `NORMAL`).
 - **Algoritmo Anti-Baneo con Enfriamiento Adaptativo**:
-  - **Modo Reposo (> 2 min sin actividad)**: El primer mensaje sale en **3 a 4.5 segundos** simulando el estado *"Escribiendo..."* (`composing`).
-  - **Modo Ráfaga (Cola activa)**: Aplica automáticamente un *Jitter* aleatorio de **20 a 45 segundos** entre envíos consecutivos para evitar patrones matemáticos detectables por Meta.
-- **Privacidad y Ahorro de Disco (Auto-Purga 24h)**: Un *worker* automático limpia el contenido sensible (`payload = NULL`) 24 horas después de enviado el mensaje, conservando únicamente los metadatos de auditoría y conteo.
+  - **Modo Reposo (> 2 min sin actividad)**: El primer mensaje simula escritura humana proporcional a la longitud del texto (**1.8 a 8.5 segundos**, configurable con `FAST_TYPING_MIN_MS` y `FAST_TYPING_MAX_MS`) enviando el estado *"Escribiendo..."* (`composing`).
+  - **Modo Ráfaga (Cola activa)**: Aplica automáticamente un *Jitter* aleatorio de **20 a 45 segundos** entre envíos consecutivos y descansos de 3 a 5 minutos cada 12–15 envíos para evitar patrones detectables por Meta.
+- **Privacidad y Ahorro de Disco (Auto-Purga 24h)**: Un *worker* automático limpia el contenido sensible (`payload = NULL`) 24 horas después en mensajes `SENT` o `FAILED` (y expira pendientes > 7 días), conservando únicamente los metadatos de auditoría y conteo.
 - **Multi-Proyecto / Multi-Cliente**: Una sola instancia de la API y una sola base de datos gestionan múltiples sistemas externos (PHP, .NET, Python, etc.) mediante su propio `x-api-key`.
 
 ---
@@ -28,11 +28,11 @@ API REST Multi-Proyecto (*Multi-Tenant*) construida con **Node.js, TypeScript, F
    docker compose up -d --build
    ```
 
-3. Ver los logs para obtener la `API Key` inicial generada automáticamente:
+3. Ver los logs para obtener la `API Key` aleatoria generada automáticamente en el primer arranque:
    ```bash
    docker logs -f iapi-server
    ```
-   *(Por defecto se crea el proyecto inicial con la llave: `iapi_default_key_2026`).*
+   *(La llave se almacena con hash SHA-256 en PostgreSQL y se muestra por única vez en consola al crearse).*
 
 ---
 

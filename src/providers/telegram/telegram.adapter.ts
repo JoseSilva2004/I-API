@@ -5,21 +5,30 @@ import { IMessageProvider, SendMessageOptions } from '../provider.interface.js';
 
 // Adaptador para envío por Telegram y alertas administrativas anti-caídas
 export class TelegramAdapter implements IMessageProvider {
-  private bots = new Map<string, Bot>();
+  private bots = new Map<string, { bot: Bot; token: string }>();
+
+  invalidateCache(tenantId: string): void {
+    this.bots.delete(tenantId);
+  }
 
   private async getBotForTenant(tenantId: string): Promise<Bot> {
-    const cached = this.bots.get(tenantId);
-    if (cached) return cached;
-
-    const tenant = await prisma.tenant.findUnique({ where: { id: tenantId } });
+    const tenant = await prisma.tenant.findUnique({
+      where: { id: tenantId },
+      select: { telegramBotToken: true }
+    });
     const token = tenant?.telegramBotToken || env.adminTelegramBotToken;
 
     if (!token) {
       throw new Error('El proyecto no tiene un telegramBotToken configurado');
     }
 
+    const cached = this.bots.get(tenantId);
+    if (cached && cached.token === token) {
+      return cached.bot;
+    }
+
     const bot = new Bot(token);
-    this.bots.set(tenantId, bot);
+    this.bots.set(tenantId, { bot, token });
     return bot;
   }
 
@@ -80,4 +89,3 @@ export class TelegramAdapter implements IMessageProvider {
 }
 
 export const telegramAdapter = new TelegramAdapter();
-

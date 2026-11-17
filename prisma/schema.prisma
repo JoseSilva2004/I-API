@@ -72,6 +72,7 @@ model MessageQueue {
   status      MessageStatus   @default(PENDING)
   attempts    Int             @default(0)
   errorReason String?         @map("error_reason")
+  lockedAt    DateTime?       @map("locked_at")
   scheduledAt DateTime        @default(now()) @map("scheduled_at")
   sentAt      DateTime?       @map("sent_at")
   createdAt   DateTime        @default(now()) @map("created_at")
@@ -80,6 +81,7 @@ model MessageQueue {
 
   @@index([status, priority, scheduledAt, createdAt])
   @@index([status, sentAt])
+  @@index([status, lockedAt])
   @@map("message_queue")
 }
 
