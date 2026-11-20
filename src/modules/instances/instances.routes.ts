@@ -9,6 +9,7 @@ import {
   requireApiKey,
   verifyQrViewToken
 } from '../../middlewares/auth.middleware.js';
+import { encryptPayload } from '../../utils/crypto.js';
 import { whatsappAdapter } from '../../providers/whatsapp/baileys.adapter.js';
 import { telegramAdapter } from '../../providers/telegram/telegram.adapter.js';
 
@@ -35,12 +36,13 @@ export async function instanceRoutes(app: FastifyInstance): Promise<void> {
       });
     }
 
+    const cleanTelegramToken = body.telegramBotToken?.trim();
     const rawApiKey = `iapi_${crypto.randomBytes(16).toString('hex')}`;
     const tenant = await prisma.tenant.create({
       data: {
         name: cleanName,
         apiKey: hashApiKey(rawApiKey),
-        telegramBotToken: body.telegramBotToken?.trim() || null
+        telegramBotToken: cleanTelegramToken ? JSON.stringify(encryptPayload(cleanTelegramToken)) : null
       }
     });
 
@@ -108,7 +110,7 @@ export async function instanceRoutes(app: FastifyInstance): Promise<void> {
     const query = request.query as { apiKey?: string; token?: string; phone?: string };
     const headerApiKey = (request.headers['x-api-key'] as string | undefined)?.trim();
 
-    // Si viene apiKey en la URL, validarla y redirigir a un token temporal (10 min) para ocultarla de la barra e historial
+    // Si viene apiKey en la URL, validarla y redirigir a un token temporal (3 min) para ocultarla de la barra e historial
     if (query.apiKey) {
       const tenant = await findTenantByApiKey(query.apiKey.trim());
       if (!tenant) {
@@ -143,6 +145,9 @@ export async function instanceRoutes(app: FastifyInstance): Promise<void> {
     const safeName = escapeHtml(tenant.name);
     const safePairing = res.pairingCode ? escapeHtml(res.pairingCode) : '';
 
+    reply.header('X-Frame-Options', 'DENY');
+    reply.header('X-Content-Type-Options', 'nosniff');
+    reply.header('Referrer-Policy', 'no-referrer');
     reply.type('text/html; charset=utf-8');
     if (res.status === 'CONNECTED') {
       return `<html><body style="font-family:sans-serif;text-align:center;padding:40px;">

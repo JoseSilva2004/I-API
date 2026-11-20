@@ -2,6 +2,7 @@ import { Bot, InputFile } from 'grammy';
 import { prisma } from '../../config/prisma.js';
 import { env } from '../../config/env.js';
 import { IMessageProvider, SendMessageOptions } from '../provider.interface.js';
+import { decryptPayload } from '../../utils/crypto.js';
 
 // Adaptador para envío por Telegram y alertas administrativas anti-caídas
 export class TelegramAdapter implements IMessageProvider {
@@ -16,10 +17,18 @@ export class TelegramAdapter implements IMessageProvider {
       where: { id: tenantId },
       select: { telegramBotToken: true }
     });
-    const token = tenant?.telegramBotToken || env.adminTelegramBotToken;
+    let token = tenant?.telegramBotToken || env.adminTelegramBotToken;
 
     if (!token) {
       throw new Error('El proyecto no tiene un telegramBotToken configurado');
+    }
+
+    try {
+      if (token.startsWith('{') && token.includes('_encrypted')) {
+        token = decryptPayload<string>(JSON.parse(token));
+      }
+    } catch {
+      // Ignora si es un token legado sin cifrar
     }
 
     const cached = this.bots.get(tenantId);

@@ -8,8 +8,9 @@ import {
 } from '@whiskeysockets/baileys';
 import { Prisma } from '@prisma/client';
 import { prisma } from '../../config/prisma.js';
+import { encryptPayload, decryptPayload } from '../../utils/crypto.js';
 
-// Reemplazo transaccional de useMultiFileAuthState sobre PostgreSQL (Evita corrupción de llaves Signal)
+// Reemplazo transaccional de useMultiFileAuthState sobre PostgreSQL (Cifrado AES-256-GCM para evitar robo de sesiones)
 export async function usePostgresAuthState(tenantId: string): Promise<{
   state: AuthenticationState;
   saveCreds: () => Promise<void>;
@@ -19,12 +20,14 @@ export async function usePostgresAuthState(tenantId: string): Promise<{
 
   const writeData = async (keyId: string, data: unknown) => {
     const serialized = serialize(data);
+    const encrypted = encryptPayload(serialized);
+
     await prisma.sessionCreds.upsert({
       where: {
         tenantId_channel_keyId: { tenantId, channel: 'WHATSAPP', keyId }
       },
-      create: { tenantId, channel: 'WHATSAPP', keyId, data: serialized },
-      update: { data: serialized }
+      create: { tenantId, channel: 'WHATSAPP', keyId, data: encrypted as unknown as Prisma.InputJsonValue },
+      update: { data: encrypted as unknown as Prisma.InputJsonValue }
     });
   };
 
@@ -35,7 +38,8 @@ export async function usePostgresAuthState(tenantId: string): Promise<{
       }
     });
     if (!row || !row.data) return null;
-    return JSON.parse(JSON.stringify(row.data), BufferJSON.reviver);
+    const decrypted = decryptPayload(row.data);
+    return JSON.parse(JSON.stringify(decrypted), BufferJSON.reviver);
   };
 
   const creds: AuthenticationCreds = (await readData('creds')) || initAuthCreds();

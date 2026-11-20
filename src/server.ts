@@ -24,7 +24,7 @@ const app = Fastify({
   },
   // Detrás de nginx u otro proxy, toma la IP real del cliente (necesario para el límite de intentos)
   trustProxy: env.trustProxy,
-  bodyLimit: 25 * 1024 * 1024 // Permite PDFs e imágenes en Base64 de hasta 25MB
+  bodyLimit: 5 * 1024 * 1024 // Reducido a 5MB para prevenir caídas por agotamiento de memoria (OOM)
 });
 
 app.get('/health', async () => ({

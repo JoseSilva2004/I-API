@@ -73,11 +73,11 @@ setInterval(() => {
   }
 }, WINDOW_MS).unref();
 
-// Genera un token temporal firmado (10 min) para la vista del QR sin exponer la API Key en el historial/refresh
+// Genera un token temporal firmado (3 min) de uso acotado para la vista del QR
 export function createQrViewToken(tenantId: string): string {
-  const expiresAt = Date.now() + 10 * 60 * 1000;
+  const expiresAt = Date.now() + 3 * 60 * 1000;
   const payload = `${tenantId}.${expiresAt}`;
-  const sig = crypto.createHmac('sha256', env.adminMasterKey).update(payload).digest('hex');
+  const sig = crypto.createHmac('sha256', env.qrTokenSecret).update(payload).digest('hex');
   return `${payload}.${sig}`;
 }
 
@@ -89,7 +89,7 @@ export function verifyQrViewToken(token: string): string | null {
   if (!tenantId || Number.isNaN(expiresAt) || Date.now() > expiresAt) return null;
 
   const expectedSig = crypto
-    .createHmac('sha256', env.adminMasterKey)
+    .createHmac('sha256', env.qrTokenSecret)
     .update(`${tenantId}.${expiresAt}`)
     .digest('hex');
 

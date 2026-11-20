@@ -159,7 +159,10 @@ export class WhatsAppAdapter implements IMessageProvider {
       },
       browser: ['I-API Gateway', 'Chrome', '122.0.0'],
       syncFullHistory: false,
-      markOnlineOnConnect: false
+      markOnlineOnConnect: false,
+      shouldIgnoreJid: (jid) => jid.endsWith('@broadcast') || jid.endsWith('@g.us'),
+      getMessage: async () => undefined,
+      cachedGroupMetadata: async () => undefined
     });
 
     const instanceState: InstanceSession = {

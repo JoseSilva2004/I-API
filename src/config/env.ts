@@ -9,11 +9,16 @@ if (adminMasterKey.length < 32 || adminMasterKey === 'iapi_master_secret_2026') 
   );
 }
 
+const encryptionKey = (process.env.ENCRYPTION_KEY || adminMasterKey).trim();
+const qrTokenSecret = (process.env.QR_TOKEN_SECRET || adminMasterKey).trim();
+
 // Configuración centralizada y validada del entorno
 export const env = {
   port: Number(process.env.PORT || 3100),
   nodeEnv: process.env.NODE_ENV || 'development',
   adminMasterKey,
+  encryptionKey,
+  qrTokenSecret,
   databaseUrl: process.env.DATABASE_URL || '',
   idleThresholdMs: Number(process.env.IDLE_THRESHOLD_MS || 120000),
   fastTypingMinMs: Number(process.env.FAST_TYPING_MIN_MS || 1800),

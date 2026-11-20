@@ -84,6 +84,37 @@ export async function messageRoutes(app: FastifyInstance): Promise<void> {
         });
       }
 
+      if (body.payload.mediaBase64) {
+        const approxBytes = Math.floor((body.payload.mediaBase64.length * 3) / 4);
+        if (approxBytes > 5 * 1024 * 1024) {
+          return reply.code(413).send({
+            status: 413,
+            success: false,
+            message: 'El archivo en mediaBase64 excede el tamaño máximo permitido de 5MB.'
+          });
+        }
+      }
+
+      if (body.payload.mimeType) {
+        const allowedMimes = new Set([
+          'application/pdf',
+          'image/jpeg',
+          'image/png',
+          'image/webp',
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+          'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+          'text/xml',
+          'application/xml'
+        ]);
+        if (!allowedMimes.has(body.payload.mimeType.toLowerCase())) {
+          return reply.code(400).send({
+            status: 400,
+            success: false,
+            message: `Tipo MIME no permitido (${body.payload.mimeType}). Formatos admitidos: PDF, imágenes JPG/PNG/WebP, Excel y Word.`
+          });
+        }
+      }
+
       if (body.payload.mediaUrl) {
         if (!env.allowMediaUrl) {
           return reply.code(400).send({
