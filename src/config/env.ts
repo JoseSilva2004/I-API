@@ -29,6 +29,8 @@ export const env = {
   humanizeMessages: process.env.HUMANIZE_MESSAGES === 'true',
   allowMediaUrl: process.env.ALLOW_MEDIA_URL !== 'false',
   trustProxy: process.env.TRUST_PROXY === 'true',
+  webhookUrl: process.env.WEBHOOK_URL || '',
+  webhookSecret: process.env.WEBHOOK_SECRET || '',
   adminTelegramBotToken: process.env.ADMIN_TELEGRAM_BOT_TOKEN || '',
   adminTelegramChatId: process.env.ADMIN_TELEGRAM_CHAT_ID || ''
 };

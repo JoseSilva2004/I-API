@@ -13,6 +13,7 @@ import { usePostgresAuthState } from './postgres.auth.js';
 import { telegramAdapter } from '../telegram/telegram.adapter.js';
 import { formatMessageContent } from '../../utils/message-format.js';
 import { fetchSafeMedia } from '../../utils/safe-url.js';
+import { dispatchWebhook } from '../../utils/webhook.js';
 
 interface InstanceSession {
   socket: WASocket;
@@ -71,6 +72,7 @@ export class WhatsAppAdapter implements IMessageProvider {
       session.socket.ev.removeAllListeners('connection.update');
       session.socket.ev.removeAllListeners('creds.update');
       session.socket.ev.removeAllListeners('messages.upsert');
+      session.socket.ev.removeAllListeners('messages.update');
       if (session.status === 'CONNECTED') {
         try {
           await session.socket.logout();
@@ -140,6 +142,7 @@ export class WhatsAppAdapter implements IMessageProvider {
         existing.socket.ev.removeAllListeners('connection.update');
         existing.socket.ev.removeAllListeners('creds.update');
         existing.socket.ev.removeAllListeners('messages.upsert');
+        existing.socket.ev.removeAllListeners('messages.update');
         existing.socket.end(undefined);
       } catch {
         // Ignorar errores al cerrar socket obsoleto
@@ -174,12 +177,32 @@ export class WhatsAppAdapter implements IMessageProvider {
 
     sock.ev.on('creds.update', saveCreds);
 
-    // Auto-Read opcional (desactivado por defecto para no marcar como leídos mensajes de pacientes sin leer)
-    if (env.autoReadMessages) {
-      sock.ev.on('messages.upsert', async ({ messages, type }) => {
-        if (type !== 'notify') return;
-        for (const msg of messages) {
-          if (!msg.key.fromMe && msg.key.remoteJid && msg.key.remoteJid !== 'status@broadcast') {
+    // Escucha de mensajes entrantes con webhook y auto-lectura opcional
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify') return;
+      for (const msg of messages) {
+        if (!msg.key.fromMe && msg.key.remoteJid && msg.key.remoteJid !== 'status@broadcast') {
+          const text =
+            msg.message?.conversation ||
+            msg.message?.extendedTextMessage?.text ||
+            msg.message?.imageMessage?.caption ||
+            msg.message?.documentMessage?.caption ||
+            '';
+
+          dispatchWebhook({
+            event: 'message.received',
+            tenantId,
+            timestamp: new Date().toISOString(),
+            data: {
+              externalId: msg.key.id,
+              from: msg.key.remoteJid,
+              pushName: msg.pushName,
+              text,
+              messageTimestamp: msg.messageTimestamp
+            }
+          }).catch(() => {});
+
+          if (env.autoReadMessages) {
             const readDelayMs = randomInt(3000, 8000);
             setTimeout(async () => {
               try {
@@ -190,8 +213,37 @@ export class WhatsAppAdapter implements IMessageProvider {
             }, readDelayMs);
           }
         }
-      });
-    }
+      }
+    });
+
+    // Escucha de actualizaciones de estado (entrega, lectura, fallo)
+    sock.ev.on('messages.update', async (updates) => {
+      for (const update of updates) {
+        if (!update.key.remoteJid || update.key.remoteJid === 'status@broadcast') continue;
+        const statusMap: Record<number, string> = {
+          0: 'FAILED',
+          2: 'SERVER_ACK',
+          3: 'DELIVERED',
+          4: 'READ',
+          5: 'PLAYED'
+        };
+        const statusName =
+          typeof update.update.status === 'number' ? statusMap[update.update.status] : undefined;
+        if (statusName) {
+          dispatchWebhook({
+            event: 'message.status',
+            tenantId,
+            timestamp: new Date().toISOString(),
+            data: {
+              externalId: update.key.id,
+              recipient: update.key.remoteJid,
+              fromMe: update.key.fromMe,
+              status: statusName
+            }
+          }).catch(() => {});
+        }
+      }
+    });
 
     // Promesa para capturar el primer QR o Pairing Code sin bloquear indefinidamente
     return new Promise((resolve) => {
@@ -362,15 +414,8 @@ export class WhatsAppAdapter implements IMessageProvider {
     }
 
     const cleanNumber = recipient.replace(/\D/g, '');
-    const results = await session.socket.onWhatsApp(cleanNumber);
-    const check = results?.[0];
-
-    if (!check || !check.exists) {
-      throw new Error(`INVALID_WHATSAPP_NUMBER: El número ${cleanNumber} no tiene WhatsApp activo`);
-    }
-
-    const jid = check.jid;
-    await session.socket.presenceSubscribe(jid);
+    const jid = recipient.includes('@') ? recipient : `${cleanNumber}@s.whatsapp.net`;
+    await session.socket.presenceSubscribe(jid).catch(() => {});
 
     const shouldHumanize = payload.humanize ?? env.humanizeMessages;
 

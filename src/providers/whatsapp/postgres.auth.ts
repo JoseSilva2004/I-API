@@ -50,15 +50,28 @@ export async function usePostgresAuthState(tenantId: string): Promise<{
       keys: {
         get: async <T extends keyof SignalDataTypeMap>(type: T, ids: string[]) => {
           const data: { [id: string]: SignalDataTypeMap[T] } = {};
-          await Promise.all(
-            ids.map(async (id) => {
-              let value = await readData(`${type}-${id}`);
-              if (type === 'app-state-sync-key' && value) {
-                value = proto.Message.AppStateSyncKeyData.fromObject(value);
-              }
-              data[id] = value;
-            })
-          );
+          if (ids.length === 0) return data;
+
+          const fullKeyIds = ids.map((id) => `${type}-${id}`);
+          const rows = await prisma.sessionCreds.findMany({
+            where: {
+              tenantId,
+              channel: 'WHATSAPP',
+              keyId: { in: fullKeyIds }
+            }
+          });
+
+          const rowMap = new Map(rows.map((r) => [r.keyId, r.data]));
+          for (const id of ids) {
+            const rawData = rowMap.get(`${type}-${id}`);
+            if (!rawData) continue;
+            const decrypted = decryptPayload(rawData);
+            let value = JSON.parse(JSON.stringify(decrypted), BufferJSON.reviver);
+            if (type === 'app-state-sync-key' && value) {
+              value = proto.Message.AppStateSyncKeyData.fromObject(value);
+            }
+            data[id] = value;
+          }
           return data;
         },
         set: async (data) => {
@@ -73,13 +86,19 @@ export async function usePostgresAuthState(tenantId: string): Promise<{
               const keyId = `${category}-${id}`;
               if (value) {
                 const serialized = serialize(value);
+                const encrypted = encryptPayload(serialized);
                 operations.push(
                   prisma.sessionCreds.upsert({
                     where: {
                       tenantId_channel_keyId: { tenantId, channel: 'WHATSAPP', keyId }
                     },
-                    create: { tenantId, channel: 'WHATSAPP', keyId, data: serialized },
-                    update: { data: serialized }
+                    create: {
+                      tenantId,
+                      channel: 'WHATSAPP',
+                      keyId,
+                      data: encrypted as unknown as Prisma.InputJsonValue
+                    },
+                    update: { data: encrypted as unknown as Prisma.InputJsonValue }
                   })
                 );
               } else {
